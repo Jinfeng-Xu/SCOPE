@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+*.log
+*.pth
+*.pt
+*.ckpt
+*.parquet
+*.npy
+rqvae/ckpt/
+TIGER-backbone/ckpt/
+TIGER-backbone/logs/
+results/*.npy
+results/*.csv
+results/*.json
+configs/tools_main.env
