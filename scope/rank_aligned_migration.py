@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Ranking-aligned constrained semantic-ID migration selection.
 
-The selector uses a full-migration GRM teacher to estimate item-level
-validation rank utility. It runs constrained beam search under the updated
-codebook, records the rank/NDCG contribution of each validation target, and
+The selector uses a GRM teacher to estimate the item-level rank-utility gain.
+It evaluates the same validation contexts under the deployed and candidate
+code interfaces, computes candidate utility minus deployed utility, then
 selects migrations under support and head-item constraints.
 """
 
@@ -128,7 +128,7 @@ def encode_histories(df: pd.DataFrame, item_to_code: np.ndarray, max_len: int) -
             if 0 <= idx < len(item_to_code):
                 flat.extend(int(x) for x in item_to_code[idx])
             else:
-                flat.extend([0, 0, 0, 0])
+                flat.extend([0] * item_to_code.shape[1])
         histories.append(flat)
         targets.append(int(row.target) - 1)
     input_ids = np.asarray(histories, dtype=np.int64)
@@ -185,6 +185,71 @@ def resolve_collisions(codes: np.ndarray, codebook_size: int) -> tuple[np.ndarra
     return result, fixes
 
 
+def evaluate_rank_utility(
+    teacher: T5ForConditionalGeneration,
+    valid_df: pd.DataFrame,
+    item_to_code: np.ndarray,
+    n_old: int,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return mean phi(rank) and context counts for old validation targets.
+
+    A target outside the returned beam has zero rank utility, which is the
+    natural top-K truncation of phi(r) = 1 / log2(1 + r).
+    """
+    input_ids_np, attention_np, targets = encode_histories(
+        valid_df, item_to_code, args.max_len
+    )
+    valid_old_mask = (targets >= 0) & (targets < n_old)
+    input_ids_np = input_ids_np[valid_old_mask]
+    attention_np = attention_np[valid_old_mask]
+    targets = targets[valid_old_mask]
+
+    trie = Trie([[0] + [int(x) for x in code] + [0] for code in item_to_code])
+    constraint_fn = prefix_allowed_tokens_fn(trie)
+    utility_sum = np.zeros(n_old, dtype=float)
+    count = np.zeros(n_old, dtype=np.int64)
+
+    with torch.no_grad():
+        for start in range(0, len(targets), args.batch_size):
+            end = start + args.batch_size
+            input_ids = torch.as_tensor(
+                input_ids_np[start:end], dtype=torch.long, device=device
+            )
+            attention = torch.as_tensor(
+                attention_np[start:end], dtype=torch.long, device=device
+            )
+            batch_targets = targets[start:end]
+            output = teacher.generate(
+                input_ids=input_ids,
+                attention_mask=attention,
+                max_length=item_to_code.shape[1] + 1,
+                num_beams=args.beam_size,
+                num_return_sequences=args.beam_size,
+                prefix_allowed_tokens_fn=constraint_fn,
+            )
+            preds = (
+                output[:, 1:]
+                .reshape(len(batch_targets), args.beam_size, -1)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            labels = item_to_code[batch_targets]
+            for item, beams, label in zip(batch_targets, preds, labels):
+                count[item] += 1
+                for rank, beam in enumerate(beams, start=1):
+                    if np.array_equal(beam, label):
+                        utility_sum[item] += float(1.0 / np.log2(rank + 1))
+                        break
+
+    observed = count > 0
+    mean_utility = np.zeros(n_old, dtype=float)
+    mean_utility[observed] = utility_sum[observed] / count[observed]
+    return mean_utility, count
+
+
 def main() -> None:
     args = parse_args()
     out_dir = Path(args.out_dir)
@@ -193,62 +258,34 @@ def main() -> None:
     old = np.load(args.old_code)
     new = np.load(args.new_code)
     n_old = len(old)
+    if old.ndim != 2 or new.ndim != 2 or old.shape[1] != new.shape[1]:
+        raise ValueError(
+            "Old and new code arrays must be two-dimensional and have the same code length"
+        )
+    if len(new) < n_old:
+        raise ValueError("The new code array cannot contain fewer items than the old code array")
     changed_mask = (old != new[:n_old]).any(axis=1)
+    old_interface = new.copy()
+    old_interface[:n_old] = old
+    old_offsets = offset_codes(old_interface, args.codebook_size)
     new_offsets = offset_codes(new, args.codebook_size)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     teacher = load_teacher(args, device)
 
     valid_df = pd.read_parquet(args.valid_parquet)
-    input_ids_np, attention_np, targets = encode_histories(valid_df, new_offsets, args.max_len)
-    valid_old_mask = (targets >= 0) & (targets < n_old)
-    input_ids_np = input_ids_np[valid_old_mask]
-    attention_np = attention_np[valid_old_mask]
-    targets = targets[valid_old_mask]
-
-    trie = Trie([[0] + [int(x) for x in code] + [0] for code in new_offsets])
-    constraint_fn = prefix_allowed_tokens_fn(trie)
-
-    rank_sum = np.zeros(n_old, dtype=float)
-    ndcg_sum = np.zeros(n_old, dtype=float)
-    hit_sum = np.zeros(n_old, dtype=float)
-    count = np.zeros(n_old, dtype=np.int64)
-
-    with torch.no_grad():
-        for start in range(0, len(targets), args.batch_size):
-            end = start + args.batch_size
-            input_ids = torch.as_tensor(input_ids_np[start:end], dtype=torch.long, device=device)
-            attention = torch.as_tensor(attention_np[start:end], dtype=torch.long, device=device)
-            batch_targets = targets[start:end]
-            output = teacher.generate(
-                input_ids=input_ids,
-                attention_mask=attention,
-                max_length=5,
-                num_beams=args.beam_size,
-                num_return_sequences=args.beam_size,
-                prefix_allowed_tokens_fn=constraint_fn,
-            )
-            preds = output[:, 1:].reshape(len(batch_targets), args.beam_size, -1).detach().cpu().numpy()
-            labels = new_offsets[batch_targets]
-            for item, beams, label in zip(batch_targets, preds, labels):
-                count[item] += 1
-                rank = 0
-                for pos, beam in enumerate(beams, start=1):
-                    if np.array_equal(beam, label):
-                        rank = pos
-                        break
-                if rank:
-                    hit_sum[item] += 1.0
-                    ndcg_sum[item] += float(1.0 / np.log2(rank + 1))
-                    rank_sum[item] += float(rank)
-
+    old_rank_utility, old_count = evaluate_rank_utility(
+        teacher, valid_df, old_offsets, n_old, args, device
+    )
+    new_rank_utility, new_count = evaluate_rank_utility(
+        teacher, valid_df, new_offsets, n_old, args, device
+    )
+    if not np.array_equal(old_count, new_count):
+        raise RuntimeError("Old and new interfaces were not evaluated on the same contexts")
+    count = old_count
     observed = count > 0
-    mean_ndcg = np.zeros(n_old, dtype=float)
-    hit_rate = np.zeros(n_old, dtype=float)
-    mean_rank_utility = np.zeros(n_old, dtype=float)
-    mean_ndcg[observed] = ndcg_sum[observed] / count[observed]
-    hit_rate[observed] = hit_sum[observed] / count[observed]
-    mean_rank_utility[observed] = mean_ndcg[observed] + 0.25 * hit_rate[observed]
+    # Positive values indicate that the candidate code improves ranking.
+    delta_rank = new_rank_utility - old_rank_utility
 
     support = item_support(args.train_parquet, n_old)
     support_norm = np.log1p(support).astype(float)
@@ -256,7 +293,7 @@ def main() -> None:
         support_norm /= support_norm.max()
     drift = np.linalg.norm(old.astype(float) - new[:n_old].astype(float), axis=1)
     drift_norm = minmax(drift, changed_mask)
-    benefit_norm = minmax(mean_rank_utility, changed_mask & observed)
+    benefit_norm = minmax(delta_rank, changed_mask & observed)
 
     configs = {
         "rank_s1p0_head0": {"support_lambda": 1.0, "drift_weight": 0.0},
@@ -277,8 +314,9 @@ def main() -> None:
             "changed": changed_mask,
             "support": support,
             "valid_target_count": count,
-            "teacher_hit_rate": hit_rate,
-            "teacher_mean_ndcg": mean_ndcg,
+            "teacher_old_rank_utility": old_rank_utility,
+            "teacher_new_rank_utility": new_rank_utility,
+            "teacher_delta_rank": delta_rank,
             "rank_benefit_norm": benefit_norm,
             "drift_norm": drift_norm,
             "support_norm": support_norm,
@@ -289,12 +327,9 @@ def main() -> None:
 
     summary = {
         "selection": args.selection,
-        "valid_old_rows": int(len(targets)),
+        "valid_old_rows": int(count.sum()),
         "observed_changed_items": int(np.sum(observed & changed_mask)),
-        "mean_hit_observed_changed": float(hit_rate[observed & changed_mask].mean())
-        if np.any(observed & changed_mask)
-        else 0.0,
-        "mean_ndcg_observed_changed": float(mean_ndcg[observed & changed_mask].mean())
+        "mean_delta_rank_observed_changed": float(delta_rank[observed & changed_mask].mean())
         if np.any(observed & changed_mask)
         else 0.0,
         "outputs": [],
@@ -318,8 +353,9 @@ def main() -> None:
             "actual_changed_old_items": int(actual_changed.sum()),
             "actual_changed_old_ratio": float(actual_changed.mean()),
             "collision_fixes": int(fixes),
-            "mean_teacher_hit_accepted": float(hit_rate[accepted].mean()) if len(accepted) else 0.0,
-            "mean_teacher_ndcg_accepted": float(mean_ndcg[accepted].mean()) if len(accepted) else 0.0,
+            "mean_teacher_delta_rank_accepted": float(delta_rank[accepted].mean())
+            if len(accepted)
+            else 0.0,
             "mean_support_accepted": float(support[accepted].mean()) if len(accepted) else 0.0,
         }
         summary["outputs"].append(row)
