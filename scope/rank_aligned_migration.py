@@ -161,6 +161,17 @@ def minmax(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return out
 
 
+def rank_positive_candidates(
+    utility: np.ndarray, changed_mask: np.ndarray, head: set[int]
+) -> list[int]:
+    """Rank feasible migrations without filling the budget with non-positive utility."""
+    return [
+        int(i)
+        for i in np.argsort(-utility)
+        if changed_mask[i] and i not in head and utility[i] > 0.0
+    ]
+
+
 def resolve_collisions(codes: np.ndarray, codebook_size: int) -> tuple[np.ndarray, int]:
     result = codes.copy()
     used: dict[tuple[int, ...], int] = {}
@@ -306,7 +317,7 @@ def main() -> None:
 
     head_k = max(1, int(round(0.05 * n_old)))
     head = set(int(i) for i in np.argsort(-support)[:head_k])
-    ranked = [int(i) for i in np.argsort(-utility) if changed_mask[i] and i not in head]
+    ranked = rank_positive_candidates(utility, changed_mask, head)
 
     diagnostics = pd.DataFrame(
         {
@@ -329,6 +340,7 @@ def main() -> None:
         "selection": args.selection,
         "valid_old_rows": int(count.sum()),
         "observed_changed_items": int(np.sum(observed & changed_mask)),
+        "positive_utility_candidates": int(len(ranked)),
         "mean_delta_rank_observed_changed": float(delta_rank[observed & changed_mask].mean())
         if np.any(observed & changed_mask)
         else 0.0,
